@@ -23,7 +23,7 @@
       try {
         const cfg = await fetch('config.json', { cache: 'no-store' }).then(r => r.json());
         const base = (cfg && cfg.apiBase) ? cfg.apiBase.replace(/\/+$/,'') : '';
-        const res  = await fetch(`${base}/`, { cache: 'no-store' });
+        const res  = await fetch(`/controller/`, { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const txt  = await res.text();
         statusEl.textContent = `Controller: healthy (${txt})`;

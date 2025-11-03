@@ -1,38 +1,27 @@
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Distributed Swarm UI</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:40px}
-      .tag{display:inline-block;padding:.25rem .5rem;border:1px solid #ddd;border-radius:8px}
-    </style>
-  </head>
-  <body>
-    <h1>Distributed Swarm — UI</h1>
-    <p class="tag">placeholder build</p>
-    <p>If you can see this via the container, the pipeline works. We’ll swap in the real dashboard next.</p>
+<script>
+(async () => {
+  const statusEl = document.createElement('p');
+  statusEl.textContent = 'Controller: checking...';
+  document.body.appendChild(statusEl);
 
-    <script>
-    (async () => {
-      const statusEl = document.createElement('p');
-      statusEl.textContent = 'Controller: checking...';
-      document.body.appendChild(statusEl);
+  try {
+    const cfg = await fetch('config.json', { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : {})
+      .catch(() => ({}));
 
-      try {
-        const cfg = await fetch('config.json', { cache: 'no-store' }).then(r => r.json());
-        const base = (cfg && cfg.apiBase) ? cfg.apiBase.replace(/\/+$/,'') : '';
-        const res  = await fetch(`/controller/`, { cache: 'no-store' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const txt  = await res.text();
-        statusEl.textContent = `Controller: healthy (${txt})`;
-        statusEl.style.color = 'green';
-      } catch (e) {
-        statusEl.textContent = `Controller: unreachable (${e.message})`;
-        statusEl.style.color = 'crimson';
-      }
-    })();
-    </script>
-  </body>
-</html>
+    const base = (cfg && cfg.apiBase ? cfg.apiBase : '').replace(/\/+$/,'');
+    // Prefer same-origin reverse proxy; fall back to apiBase if provided
+    const url = base ? `${base}/healthz` : `/controller/healthz`;
+
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const txt = await res.text();
+
+    statusEl.textContent = `Controller: healthy (${txt})`;
+    statusEl.style.color = 'green';
+  } catch (e) {
+    statusEl.textContent = `Controller: unreachable (${e.message})`;
+    statusEl.style.color = 'crimson';
+  }
+})();
+</script>

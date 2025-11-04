@@ -8,8 +8,8 @@ RUN rm -rf /usr/share/nginx/html/* \
 COPY public/ /usr/share/nginx/html/
 COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 
-# Catch bad nginx configs at build time (fails the build if broken)
-RUN nginx -t
+# Catch bad nginx configs at build time (fails the build if broken, with diagnostics)
+RUN nginx -t || (echo >&2 '---- nginx config dump ----'; nginx -T; exit 1)
 
 # Healthcheck the *proxy* path, not just /
 # -s silent, -f fail on >=400, -S show errors; start-period avoids cold-start flapping

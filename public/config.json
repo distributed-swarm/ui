@@ -1,5 +1,5 @@
 {
-  "CONTROLLER_URL": "http://192.168.12.142:8081",
+  "CONTROLLER_URL": "/api",
   "POLL_INTERVAL_MS": 1500,
-  "WEBSOCKET_URL": "ws://192.168.12.142:8081/ws" 
+  "WEBSOCKET_URL": "/ws"
 }

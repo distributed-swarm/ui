@@ -9,7 +9,6 @@ COPY public/ /usr/share/nginx/html/
 COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 
 # Healthcheck THROUGH the proxy to the controller
-# Assumes nginx maps /api -> http://<controller>/ (and controller serves /healthz)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1/api/healthz > /dev/null || exit 1
 

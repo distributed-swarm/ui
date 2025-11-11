@@ -6,14 +6,16 @@
 
   try {
     const cfg = await fetch('config.json', { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : {})
-      .catch(() => ({}));
+      .then(r => r.ok ? r.json() : {});
 
-    const base = (cfg && cfg.apiBase ? cfg.apiBase : '').replace(/\/+$/,'');
-    // Prefer same-origin reverse proxy; fall back to apiBase if provided
-    const url = base ? `${base}/healthz` : `/controller/healthz`;
+    // Expect proxy-mode keys from config.json
+    //   CONTROLLER_URL: "/api"
+    //   WEBSOCKET_URL:  "/ws"  (not used here, but future-proof)
+    const baseFromCfg = (cfg && typeof cfg.CONTROLLER_URL === 'string') ? cfg.CONTROLLER_URL : '/api';
+    const base = baseFromCfg.replace(/\/+$/, ''); // trim trailing slash(es)
+    const healthUrl = `${base}/healthz`;          // e.g., /api/healthz
 
-    const res = await fetch(url, { cache: 'no-store' });
+    const res = await fetch(healthUrl, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const txt = await res.text();
 

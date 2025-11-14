@@ -5,38 +5,188 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Swarm UI</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    .ok { color: green; }
-    .bad { color: crimson; }
+    :root { --gap: 12px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 16px; color: #111; }
+    h1 { margin: 0 0 8px; }
+    .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--gap); margin-top: var(--gap); }
+    .card { border: 1px solid #e5e5e5; border-radius: 10px; padding: 12px 14px; background: #fff; }
+    .kpi { font-size: 28px; font-weight: 700; margin-top: 6px; }
+    .ok { color: #137333; }
+    .bad { color: #b3261e; }
+    #spark { width: 100%; height: 120px; display: block; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+    .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .muted { color: #666; font-size: 12px; }
   </style>
 </head>
 <body>
   <h1>Distributed Swarm Dashboard</h1>
-  <p id="status">Controller: checking...</p>
+  <p id="status" class="muted">Controller: checking…</p>
+
+  <!-- KPIs -->
+  <div class="row">
+    <div class="card">
+      <div>Queue</div>
+      <div id="queueLen" class="kpi mono">0</div>
+      <div class="muted">pending tasks</div>
+    </div>
+    <div class="card">
+      <div>Agents online</div>
+      <div id="agentsOnline" class="kpi mono">0</div>
+      <div class="muted">registered & heartbeat</div>
+    </div>
+    <div class="card">
+      <div>Throughput (60s)</div>
+      <div id="rate60s" class="kpi mono">0</div>
+      <div class="muted">tasks/sec (rolling)</div>
+    </div>
+    <div class="card">
+      <div>Completed</div>
+      <div id="completed" class="kpi mono">0</div>
+      <div class="muted">total in last 24h window</div>
+    </div>
+    <div class="card">
+      <div>Leased</div>
+      <div id="leased" class="kpi mono">0</div>
+      <div class="muted">tasks handed to agents</div>
+    </div>
+    <div class="card">
+      <div>Failed</div>
+      <div id="failed" class="kpi mono">0</div>
+      <div class="muted">aggregate errors reported</div>
+    </div>
+  </div>
+
+  <!-- Sparkline -->
+  <div class="row">
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <div>Throughput sparkline</div>
+        <div class="muted">last 60s, 1s sample</div>
+      </div>
+      <canvas id="spark" width="1000" height="120"></canvas>
+    </div>
+  </div>
+
+  <!-- Per-op table -->
+  <div class="row">
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <div>Per-op metrics</div>
+        <div id="opsUpdated" class="muted"></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>op</th>
+            <th class="mono">count</th>
+            <th class="mono">avg duration (ms)</th>
+          </tr>
+        </thead>
+        <tbody id="opsBody"></tbody>
+      </table>
+    </div>
+  </div>
 
   <script>
   (async () => {
     const statusEl = document.getElementById('status');
 
+    // Read controller base from config.json. In proxy mode, set CONTROLLER_URL to "/api".
+    let base = '/api';
     try {
-      // Always read config.json; nginx sets it no-store so you can change targets without rebuilds
       const cfg = await fetch('config.json', { cache: 'no-store' }).then(r => r.json());
+      base = (cfg.CONTROLLER_URL || '/api').replace(/\/+$/, '');
+    } catch {
+      // fall back to /api silently
+    }
 
-      // Proxy mode: config.json must have CONTROLLER_URL: "/api"
-      const base = (cfg.CONTROLLER_URL || '/api').replace(/\/+$/, '');
-      const healthUrl = `${base}/healthz`;   // => /api/healthz
-
-      const res = await fetch(healthUrl, { cache: 'no-store' });
+    // Health check once so the banner doesn’t lie
+    try {
+      const res = await fetch(`${base}/healthz`, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const txt = await res.text();
-
-      statusEl.textContent = `Controller: healthy (${txt})`;
+      const j = await res.json();
+      statusEl.textContent = `Controller: healthy • agents=${j.agents_online} • queue=${j.queue_len}`;
       statusEl.className = 'ok';
     } catch (e) {
       statusEl.textContent = `Controller: unreachable (${e.message})`;
       statusEl.className = 'bad';
     }
+
+    // Small helpers
+    const $ = (sel) => document.querySelector(sel);
+    const setText = (sel, v) => { const el = $(sel); if (el) el.textContent = v; };
+
+    // Minimal canvas sparkline with autoscale
+    function updateThroughputChart(values) {
+      const c = $('#spark'); if (!c) return;
+      const ctx = c.getContext('2d');
+      const w = c.width, h = c.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (!values || values.length === 0) return;
+      const max = Math.max(1, ...values);
+      const n = values.length;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const x = (i / Math.max(1, n - 1)) * (w - 2) + 1;
+        const y = h - (values[i] / max) * (h - 2) - 1;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    async function pollStats() {
+      try {
+        const r = await fetch(`${base}/stats`, { cache: 'no-store' });
+        const s = await r.json();
+        setText('#queueLen', s.queue_len);
+        setText('#agentsOnline', s.agents_online);
+        setText('#rate60s', s.rate_tasks_per_sec["60s"]);
+        setText('#completed', s.completed_total);
+        setText('#failed', s.failed_total);
+        setText('#leased', s.leased_total);
+      } catch {}
+    }
+
+    async function pollSpark() {
+      try {
+        const r = await fetch(`${base}/stats/sparkline?seconds=60`, { cache: 'no-store' });
+        const { points } = await r.json();
+        updateThroughputChart(points.map(p => p.tps));
+      } catch {}
+    }
+
+    async function pollOps() {
+      try {
+        const r = await fetch(`${base}/stats/ops`, { cache: 'no-store' });
+        const { ops } = await r.json();
+        const body = $('#opsBody');
+        if (!body) return;
+        body.innerHTML = '';
+        Object.entries(ops || {}).sort().forEach(([op, v]) => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${op}</td>
+            <td class="mono">${v.count ?? 0}</td>
+            <td class="mono">${(v.avg_duration_ms ?? 0).toFixed(2)}</td>
+          `;
+          body.appendChild(tr);
+        });
+        const ts = new Date().toLocaleTimeString();
+        setText('#opsUpdated', `updated ${ts}`);
+      } catch {}
+    }
+
+    // Kick once, then poll
+    await Promise.all([pollStats(), pollSpark(), pollOps()]);
+    setInterval(pollStats, 1000);       // 1s
+    setInterval(pollSpark, 1000);       // 1s
+    setInterval(pollOps, 5000);         // 5s
   })();
   </script>
 </body>
 </html>
+

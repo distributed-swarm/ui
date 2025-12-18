@@ -1,15 +1,17 @@
 FROM nginx:1.27-alpine
 
-# Clean default HTML and add curl for healthchecks
+# Basic tools (curl is handy for smoke tests)
 RUN rm -rf /usr/share/nginx/html/* \
     && apk add --no-cache curl
 
-# Static UI + reverse-proxy config
+# Static UI (build artifact lives in public/)
 COPY public/ /usr/share/nginx/html/
-COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 
-# Healthcheck THROUGH the proxy to the controller
-HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1/api/healthz > /dev/null || exit 1
+# Default API upstream:
+# - In swarm / docker network: controller resolves by DNS name "controller"
+# - Override at runtime with:  -e API_UPSTREAM=http://host.docker.internal:8080
+ENV API_UPSTREAM=http://controller:8080
 
-EXPOSE 80
+# Use nginx envsubst templating (processed at container start by nginx entrypoint)
+# This will generate: /etc/nginx/conf.d/default.conf
+COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template

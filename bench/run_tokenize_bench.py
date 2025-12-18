@@ -10,7 +10,7 @@ Artifacts per run:
   runs/<...>/submit_log.jsonl
 
 Modes:
-  --mode fixed-rate  : submit at --rate tasks/sec for --duration seconds
+  --mode fixed-rate  : submit at --rate tasks/sec for --duration seconds (token-bucket scheduler)
   --mode flood       : keep submitting as fast as possible with --max_inflight cap
 
 Usage examples:
@@ -48,10 +48,11 @@ class RunConfig:
     op: str
     payload_bytes: int
     seed: int
+    burst: int
+    tick_ms: int
 
 
 def utc_stamp() -> str:
-    # filesystem-friendly
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
@@ -69,7 +70,6 @@ def jsonl_append(path: Path, obj: Any) -> None:
 
 
 def rand_text(n: int) -> str:
-    # deterministic-ish text generator if seed is set globally
     alphabet = string.ascii_letters + string.digits + "     \n"
     return "".join(random.choice(alphabet) for _ in range(n))
 
@@ -86,35 +86,23 @@ def get_json(session: requests.Session, url: str, timeout_s: float = 5.0) -> Any
 
 def submit_job(session: requests.Session, base: str, op: str, text: str, timeout_s: float = 10.0) -> Dict[str, Any]:
     """
-    Adjust this if your /api/job contract differs.
-
-    Tries a couple common payload shapes. If both fail, raises with the response.
+    Controller expects: {"op": "...", "payload": {...}}
     """
     url = f"{base.rstrip('/')}/api/job"
 
-    payloads = [
-        # Shape A (common)
-        {"op": op, "input": {"text": text}},
-        # Shape B (alternate)
-        {"task": {"op": op, "input": {"text": text}}},
-    ]
+    # Contract confirmed by controller error: "Each job requires {op, payload}"
+    payload = {"op": op, "payload": {"text": text}}
 
-    last_err = None
-    for payload in payloads:
-        try:
-            r = session.post(url, json=payload, timeout=timeout_s)
-            if 200 <= r.status_code < 300:
-                # Might be {job_id:..} or {id:..} or something else; we just log it
-                try:
-                    return {"ok": True, "status": r.status_code, "resp": r.json()}
-                except Exception:
-                    return {"ok": True, "status": r.status_code, "resp_text": r.text[:500]}
-            else:
-                last_err = {"ok": False, "status": r.status_code, "resp_text": r.text[:1000], "payload": payload}
-        except Exception as e:
-            last_err = {"ok": False, "exc": repr(e), "payload": payload}
-
-    raise RuntimeError(f"Submit failed for all payload shapes. Last error: {last_err}")
+    try:
+        r = session.post(url, json=payload, timeout=timeout_s)
+        if 200 <= r.status_code < 300:
+            try:
+                return {"ok": True, "status": r.status_code, "resp": r.json()}
+            except Exception:
+                return {"ok": True, "status": r.status_code, "resp_text": r.text[:500]}
+        return {"ok": False, "status": r.status_code, "resp_text": r.text[:1000], "payload": payload}
+    except Exception as e:
+        return {"ok": False, "exc": repr(e), "payload": payload}
 
 
 # --------------------------
@@ -135,7 +123,6 @@ def run_bench(cfg: RunConfig) -> Path:
 
     session = requests.Session()
 
-    # Preflight
     agents_url = f"{cfg.controller_url.rstrip('/')}/api/agents"
     stats_url = f"{cfg.controller_url.rstrip('/')}/stats"
     health_url = f"{cfg.controller_url.rstrip('/')}/healthz"
@@ -150,7 +137,6 @@ def run_bench(cfg: RunConfig) -> Path:
     agents_start = get_json(session, agents_url, timeout_s=10.0)
     jdump(out_dir / "agents_start.json", agents_start)
 
-    # Stats sampler loop runs in the main thread with time slicing.
     stats_path = out_dir / "stats_timeseries.jsonl"
     submit_log_path = out_dir / "submit_log.jsonl"
 
@@ -160,16 +146,17 @@ def run_bench(cfg: RunConfig) -> Path:
     submitted = 0
     submit_fail = 0
 
-    # For flood mode, track inflight as "submitted - completed_delta".
-    # We'll estimate completions by reading /stats if it has completed_total; else we just cap submissions.
+    # Flood mode inflight estimation via /stats.completed_total if present
     last_completed_total: Optional[int] = None
     baseline_completed_total: Optional[int] = None
 
     next_sample = start
-    next_tick = start
 
-    # Fixed-rate timing control
-    interval = 1.0 / cfg.rate_tps if (cfg.mode == "fixed-rate" and cfg.rate_tps and cfg.rate_tps > 0) else 0.0
+    # Fixed-rate token bucket state
+    rate = float(cfg.rate_tps or 0)
+    owed = 0.0
+    last_tick = start
+    tick_sleep_s = max(0.0, cfg.tick_ms / 1000.0)
 
     while True:
         now = time.time()
@@ -182,8 +169,6 @@ def run_bench(cfg: RunConfig) -> Path:
                 st = get_json(session, stats_url, timeout_s=5.0)
                 jsonl_append(stats_path, {"t": now, "stats": st})
 
-                # Try to discover completed_total
-                # We don't know your exact schema; attempt common keys.
                 completed_total = None
                 for key in ["completed_total", "tasks_completed", "ctrl_tasks_completed"]:
                     if isinstance(st, dict) and key in st and isinstance(st[key], int):
@@ -202,42 +187,55 @@ def run_bench(cfg: RunConfig) -> Path:
 
         # Submit tasks according to mode
         if cfg.mode == "fixed-rate":
-            # Submit exactly one task per interval; catch up if we lag, but don't spiral
-            if now >= next_tick:
-                text = rand_text(cfg.payload_bytes)
-                try:
-                    resp = submit_job(session, cfg.controller_url, cfg.op, text)
-                    submitted += 1
-                    jsonl_append(submit_log_path, {"t": now, "event": "submit_ok", "n": submitted, "resp": resp})
-                except Exception as e:
-                    submit_fail += 1
-                    jsonl_append(submit_log_path, {"t": now, "event": "submit_fail", "n": submitted, "fails": submit_fail, "error": repr(e)})
+            # Token bucket: accrue "owed" submits based on elapsed time; submit in bursts.
+            dt = now - last_tick
+            if dt < 0:
+                dt = 0
+            last_tick = now
+            owed += rate * dt
 
-                next_tick += interval
-                # If we fell behind by a lot, jump forward (prevents huge backlog of "catch-up" submits)
-                if next_tick < now - 2.0:
-                    next_tick = now
+            # How many should we submit this tick?
+            k = int(owed)
+            if k <= 0:
+                # avoid hot spin
+                if tick_sleep_s > 0:
+                    time.sleep(tick_sleep_s)
+                continue
+
+            if cfg.burst > 0:
+                k = min(k, cfg.burst)
+
+            for _ in range(k):
+                text = rand_text(cfg.payload_bytes)
+                resp = submit_job(session, cfg.controller_url, cfg.op, text)
+                if resp.get("ok"):
+                    submitted += 1
+                    jsonl_append(submit_log_path, {"t": time.time(), "event": "submit_ok", "n": submitted, "resp": resp})
+                else:
+                    submit_fail += 1
+                    jsonl_append(submit_log_path, {"t": time.time(), "event": "submit_fail", "n": submitted, "fails": submit_fail, "resp": resp})
+            owed -= k
+
+            if tick_sleep_s > 0:
+                time.sleep(tick_sleep_s)
 
         elif cfg.mode == "flood":
-            # Estimate inflight if we can; otherwise just use max_inflight as a soft cap via sleep
             inflight = None
             if baseline_completed_total is not None and last_completed_total is not None:
                 inflight = submitted - (last_completed_total - baseline_completed_total)
 
             if inflight is None or inflight < cfg.max_inflight:
                 text = rand_text(cfg.payload_bytes)
-                try:
-                    resp = submit_job(session, cfg.controller_url, cfg.op, text)
+                resp = submit_job(session, cfg.controller_url, cfg.op, text)
+                if resp.get("ok"):
                     submitted += 1
-                    # Log less verbosely in flood mode
                     if submitted % 1000 == 0:
                         jsonl_append(submit_log_path, {"t": now, "event": "submit_ok", "n": submitted, "inflight": inflight, "resp_hint": resp.get("status")})
-                except Exception as e:
+                else:
                     submit_fail += 1
-                    jsonl_append(submit_log_path, {"t": now, "event": "submit_fail", "n": submitted, "fails": submit_fail, "error": repr(e)})
+                    jsonl_append(submit_log_path, {"t": now, "event": "submit_fail", "n": submitted, "fails": submit_fail, "resp": resp})
                     time.sleep(0.05)
             else:
-                # Backpressure
                 time.sleep(0.002)
 
         else:
@@ -278,6 +276,9 @@ def main() -> None:
     ap.add_argument("--op", default="map_tokenize")
     ap.add_argument("--payload_bytes", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--burst", type=int, default=200, help="max submits per scheduler tick (fixed-rate)")
+    ap.add_argument("--tick_ms", type=int, default=2, help="sleep per scheduler tick in ms (fixed-rate)")
+
     args = ap.parse_args()
 
     cfg = RunConfig(
@@ -290,6 +291,8 @@ def main() -> None:
         op=args.op,
         payload_bytes=args.payload_bytes,
         seed=args.seed,
+        burst=args.burst,
+        tick_ms=args.tick_ms,
     )
 
     out = run_bench(cfg)
@@ -298,4 +301,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
